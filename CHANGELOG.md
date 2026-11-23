@@ -25,6 +25,7 @@ Everything that has changed in Horizon Nav, newest first. Each version lists wha
 - Português (Brasil): Brazilian Portuguese, with Brazil's own words (tela, celular, salvar, pedágio, rotatória, "Calculando…") and voice, chosen by itself on a Brazilian phone (thanks to wberaldo, #284)
 
 ### Fixed
+- The sign on the map where the speed limit changes (like Sygic's) now shows on roads the route came without limits for, which with Mapbox is most UK roads. The limits on the road ahead are read from OpenStreetMap (or from a downloaded area) in the background, a few kilometres at a time, and only limits that are really posted count. The small next-limit sign by your speedometer shows them too (thanks to SonicBjork)
 - Portrait, on a route: a warning (traffic jam, camera…) now shows under the turn card instead of on top of it, where it hid the turn and the distance
 - Dim the screen at night now really dims: it's half of what the screen is at, never brighter. It used to set a fixed 50%, which is brighter than most screens at night (testers' group)
 - Rain on the map on a clear day: outside Europe and North America the weather service's rainfall figures are estimates, and a trace of forecast drizzle put rain on the map in sunshine. A clear sky is now taken as dry, and it takes more than a trace (thanks to pc4096)

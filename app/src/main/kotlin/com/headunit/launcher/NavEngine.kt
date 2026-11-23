@@ -3183,7 +3183,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         turnArrowKey = -1; map.setTurnArrow(emptyList())
         clearLiveAlts(); liveSaid.clear(); radar = emptyList(); radarSig = 0; bendsFor = null; bends = emptyList()
         flushRoads()
-        sessionAvoid.clear(); closuresAvoided.clear(); altListOpen = false; nextLimit = null; map.setSpeedChange(null, null); routeZones = emptyList(); avgInfo = null; avgIn = null; servicesAhead = emptyList(); barEvents = emptyList()
+        sessionAvoid.clear(); closuresAvoided.clear(); altListOpen = false; nextLimit = null; map.setSpeedChange(null, null); osmLim = emptyList(); osmLimRoute = null; osmLimTo = -1.0; routeZones = emptyList(); avgInfo = null; avgIn = null; servicesAhead = emptyList(); barEvents = emptyList()
         rawServices = emptyList(); servicesFor = null; rawHz = emptyList(); rawAvg = emptyList(); hzWinRoute = null; hzWinEnd = -1.0; avgWinRoute = null; avgWinEnd = -1.0; avgCacheFor = null
         placed = null; placedSig = 0; avgAlerted.clear(); hzAlerted.clear(); zoneAlerted.clear(); stopsEditor = false
         jamSig = 0; map.showJams(emptyList())
@@ -3378,9 +3378,17 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     /** While navigating a TomTom route: the posted limit for exactly where you are on it, updated with every GPS fix. */
     private fun applyRouteLimit(r: Route, prog: Double, p: Fix) {
         val secs = r.limits
-        if (secs.isEmpty()) { clearRouteLimitIfNeeded(); return }
         // a few metres ahead, to make up for the GPS being about a second behind
         val at = prog + min(max(p.speed, 0.0) * 0.8, 20.0)
+        // where the route came without limits (often the case with Mapbox's data in the UK), OpenStreetMap's limits for the road
+        // ahead are read in the background, so the sign on the map still shows where the limit changes
+        val osm = osmAheadFor(r, at, secs)
+        if (secs.isEmpty()) {
+            clearRouteLimitIfNeeded()
+            val ahead0 = (max(p.speed, 0.0) * 15.0).coerceIn(250.0, 800.0) * (if (nextLimit != null) 1.3 else 1.0)
+            showNextLimit(r, at, RouteLimitsAhead.nextChange(osm, at, ahead0, speedLimit))
+            return
+        }
         var lo = 0; var hi = secs.size - 1; var hit: LimitSec? = null
         while (lo <= hi) {
             val m = (lo + hi) ushr 1
@@ -3402,6 +3410,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             if (sc.ms < 2.0) continue
             if (curMs == null || kotlin.math.abs(sc.ms - curMs) > 0.5) { nx = sc.ms to (sc.off - at); break }
         }
+        // a change OpenStreetMap knows of in a stretch the route has no limits for, if it comes sooner
+        if (osm.isNotEmpty()) {
+            val o = RouteLimitsAhead.nextChange(osm, at, ahead, curMs) { RouteLimitsAhead.inside(secs, it) }
+            if (o != null && (nx == null || o.second < nx.second)) nx = o
+        }
         if (hit == null) {
             // #283: a gap in the route's speed-limit sections must not leave the last section's limit showing as if it still applied.
             clearRouteLimitIfNeeded()
@@ -3414,6 +3427,55 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         if (speedLimit != hit.ms || limitEstimated) { speedLimit = hit.ms; limitEstimated = false }
         checkLimitChange(hit.ms, false)
         limitOkAt = routeLimitAt; limitOkPos = p.pos
+    }
+
+    /** OpenStreetMap's posted limits along the current route (metres along it), for the stretches the route has none for. */
+    private var osmLim: List<LimitSec> = emptyList()
+    private var osmLimRoute: Route? = null
+    private var osmLimTo = -1.0
+    private var osmLimBusy = false
+    private var osmLimFailAt = 0L
+
+    /**
+     * The OpenStreetMap limits known for [r] (empty when none, or when the route's own limits cover the road ahead), and starts
+     * reading the next few kilometres when the known ones are about to run out.
+     */
+    private fun osmAheadFor(r: Route, at: Double, secs: List<LimitSec>): List<LimitSec> {
+        if (osmLimRoute !== r) { osmLim = emptyList(); osmLimRoute = r; osmLimTo = -1.0; osmLimFailAt = 0L }
+        if (!prefs.b(PreferenceKeys.NEXT_LIMIT, true)) return emptyList()
+        val win = min(1500.0, r.len - at)
+        if (win <= 50.0) return osmLim
+        // the route's own limits cover the road ahead: nothing to fill in
+        if (RouteLimitsAhead.covered(secs, at, at + win) >= win - 40.0) return osmLim
+        val now = System.currentTimeMillis()
+        if (!osmLimBusy && osmLimTo < at + 1200.0 && osmLimTo < r.len && now - osmLimFailAt > 30_000L) {
+            osmLimBusy = true
+            val from = max(0.0, at - 30.0); val to = min(r.len, at + 3000.0)
+            scope.launch {
+                val got = try {
+                    withContext(Dispatchers.IO) {
+                        val start = RouteLimitsAhead.pointAt(r, from) ?: return@withContext null
+                        val country = Overpass.countryAt(start)
+                        // a downloaded area with speed limits: its roads, straight from the file; otherwise one small online request
+                        val local = Overpass.localWays
+                        val ways: List<Overpass.Way> = if (local != null && local(start) != null) {
+                            val seen = HashMap<Long, Overpass.Way>()
+                            var o = from
+                            while (o <= to) { RouteLimitsAhead.pointAt(r, o)?.let { pt -> local(pt)?.forEach { w -> seen.putIfAbsent(w.id, w) } }; o += 200.0 }
+                            seen.values.toList()
+                        } else if (online()) Overpass.waysAlong(RouteLimitsAhead.lineBetween(r, from, to)) else return@withContext null
+                        RouteLimitsAhead.sections(r, from, to, ways, country)
+                    }
+                } catch (e: Exception) { null }
+                osmLimBusy = false
+                if (osmLimRoute !== r) return@launch
+                if (got == null) { osmLimFailAt = System.currentTimeMillis(); return@launch }
+                // keep what's still ahead, then the new stretch
+                osmLim = osmLim.filter { it.end > from - 500.0 && it.off < from }.map { if (it.end > from) LimitSec(it.off, from, it.ms) else it } + got
+                osmLimTo = to
+            }
+        }
+        return osmLim
     }
 
     /** Shows (or clears) the next speed limit change [nx] (m/s to metres ahead of [at]) by the limit sign and on the map. */
