@@ -256,20 +256,11 @@ object Overpass {
             try { cacheWays = loadWays(ahead); cacheAt = ahead }
             catch (e: Exception) { if (c0 == null || Geo.dist(c0, p) > 210.0) throw e }
         }
-        lastError = null
-        matchLimit(cacheWays, p, heading, country)
-    } catch (e: Exception) { lastError = e.message ?: e.javaClass.simpleName; null }
-
-    /**
-     * The limit of the road among [ways] that [p] is on, heading [heading] (degrees, or negative when unknown): the posted one when
-     * OpenStreetMap has it, otherwise the usual limit for that kind of road. Null when no road is close enough.
-     */
-    fun matchLimit(ways: List<Way>, p: LL, heading: Double, country: String): Limit? {
         var best: Way? = null
         var bd = 1e9; var bDist = 1e9; var bDiff = 90.0; var bAligned = false
         val mLat = 111320.0
         val mLon = 111320.0 * Math.cos(Math.toRadians(p.lat))
-        for (w in ways) {
+        for (w in cacheWays) {
             var d = 1e9; var brg = 0.0
             for (n in 0 until w.g.size - 1) {
                 val a = w.g[n]; val b = w.g[n + 1]
@@ -295,12 +286,11 @@ object Overpass {
             }
             if (d + pen < bd) { bd = d + pen; best = w; bDist = d; bDiff = diff; bAligned = aligned }
         }
-        val w = (if (bd <= 30.0) best else null) ?: return null
-        return limitOf(w, bDist, bDiff, bAligned, heading, country)
-    }
-
-    private fun limitOf(w: Way, bDist: Double, bDiff: Double, bAligned: Boolean, heading: Double, country: String): Limit {
-        return w.tags.let { t ->
+        lastError = null
+        val w = if (bd <= 30.0) best else null
+        if (w == null) null
+        else {
+            val t = w.tags
             // a limit that differs by direction: forward is the way the road is drawn
             val dirKey = if (heading >= 0 && bDiff > 90.0) "maxspeed:backward" else "maxspeed:forward"
             val posted = parseSpeed(t.optString(dirKey), country)
@@ -318,27 +308,7 @@ object Overpass {
             else estimate(t, country)?.let { Limit(if (country == "GB") snapGb(it) else it, true, road, w.id, names, sure) }
                 ?: Limit(-1.0, true, road, w.id, names, sure)
         }
-    }
-
-    /**
-     * The roads along [line] (a stretch of route ahead), in one small request, so the limits on the way can be read before you get
-     * there (for the sign on the map where the limit changes, when the route itself came without limits).
-     */
-    fun waysAlong(line: List<LL>): List<Way> {
-        if (line.size < 2) return emptyList()
-        val coords = line.joinToString(",") { String.format(java.util.Locale.US, "%.6f,%.6f", it.lat, it.lon) }
-        val els = run("[out:json][timeout:15];way(around:25,$coords)[\"highway\"];out tags geom 400;", 10000, 20000, 2)
-        val out = ArrayList<Way>()
-        for (i in 0 until els.length()) {
-            val e = els.getJSONObject(i)
-            val tags = e.optJSONObject("tags") ?: continue
-            if (tags.optString("highway") !in driveable) continue
-            val g = e.optJSONArray("geometry") ?: continue
-            val pts = (0 until g.length()).mapNotNull { n -> g.optJSONObject(n)?.let { o -> LL(o.getDouble("lat"), o.getDouble("lon")) } }
-            if (pts.size >= 2) out += Way(e.optLong("id", 0L), tags, pts)
-        }
-        return out
-    }
+    } catch (e: Exception) { lastError = e.message ?: e.javaClass.simpleName; null }
 
     /** Limits given as a zone ("DE:urban", "FR:rural", "DE:zone30"): the usual urban limit is 50 km/h almost everywhere in Europe. */
     private fun zoneSpeed(v: String, country: String): Double? {

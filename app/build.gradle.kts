@@ -153,8 +153,6 @@ dependencies {
 
     // Small, fast JVM tests for camera and GPS decision policies; these don't require a device.
     testImplementation("junit:junit:4.13.2")
-    // the real org.json for tests (Android's own is only a stub off the device)
-    testImplementation("org.json:json:20240303")
 }
 
 // After a release build, put the APK in one folder with a clear name (HorizonNav-public.apk), where the GitHub build picks it up.
