@@ -1,0 +1,41 @@
+name: Test APK
+
+# A test build of a development branch, for trying a change on a phone. It needs no secrets (no signing key, no API keys): it is
+# the debug build, which installs beside the real app as "Horizon Nav Dev", so the real one needn't be uninstalled. Never published.
+on:
+  push:
+    branches: ["ccr-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept the Android licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.4
+
+      - name: Run the unit tests
+        run: gradle :app:testPublicDebugUnitTest
+
+      - name: Build the test APK
+        run: gradle :app:assemblePublicDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HorizonNav-Dev-apk
+          path: app/build/outputs/apk/public/debug/*.apk
+          retention-days: 14
