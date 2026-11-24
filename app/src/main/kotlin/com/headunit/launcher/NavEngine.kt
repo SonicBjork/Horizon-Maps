@@ -61,6 +61,8 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     var busy by mutableStateOf(false)
     var previewing by mutableStateOf(false)
     var northUp by mutableStateOf(false)
+    /** The way the map is turned (0 = north at the top), for the compass button. */
+    var compassDeg by mutableStateOf(0.0)
     var results by mutableStateOf<List<Place>>(emptyList())
     var alternatives by mutableStateOf(false)
     /** The current weather: shared by the phone's engine and Android Auto's (each has its own NavEngine), so a refresh in either
@@ -296,6 +298,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     private var lastBeep = 0L
     /** The over-the-limit chime can sound (it has once since you went over), and the limit it was for. */
     private var beepArmed = true
+    private var topArmed = true
     private var beepLim: Double? = null
     private var breakNext = 7200L
     private var tripPts = ArrayList<LL>()
@@ -918,7 +921,12 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             // held far too long (a "give back" was lost): start again from nothing
             if (focusHolds > 0 && now - focusSince > 90_000) { forceGiveBack("held over 90 s"); }
             if (focusHolds++ == 0) {
-                val req = if (voiceChan != "nav") android.media.AudioFocusRequest.Builder(android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                // (Android lets the music app decide how far it drops, so it can't be lowered further from here: "pause" asks it to stop
+                // for the voice and carry on after, GitHub #338. Only for the voice, not the beeps)
+                val pause = why == "voice" && prefs.b(PreferenceKeys.VOICE_PAUSES_MUSIC, false)
+                val req = if (pause) android.media.AudioFocusRequest.Builder(android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(if (voiceChan != "nav") speechAttrs else focusOne.audioAttributes).setOnAudioFocusChangeListener { }.build()
+                else if (voiceChan != "nav") android.media.AudioFocusRequest.Builder(android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(speechAttrs).setOnAudioFocusChangeListener { }.build() else focusOne
                 focusHeld = req; focusSince = now
                 val r = try { audioMgr.requestAudioFocus(req) } catch (e: Exception) { -1 }
@@ -1043,7 +1051,10 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                     android.location.Geocoder(ctx, Locale.UK).getFromLocation(lat, lon, 1)?.firstOrNull()?.countryCode
                 } catch (e: Exception) { null }
                 // no geocoder on this unit (or no signal): a rough outline of Great Britain and Northern Ireland
-                g ?: if (lat in 49.85..60.9 && lon in -8.2..1.8 && !(lon < -5.45 && lat < 54.05) && !(lat < 51.0 && lon > 1.0)) "GB" else null
+                g ?: (if (lat in 49.85..60.9 && lon in -8.2..1.8 && !(lon < -5.45 && lat < 54.05) && !(lat < 51.0 && lon > 1.0)) "GB" else null)
+                    // (then Mapbox, if there's a token: head units mostly have no geocoder, so the country stayed unknown outside Britain
+                    // and roundabouts were drawn the British way round in the Netherlands, GitHub #285)
+                    ?: (if (mbToken.isNotBlank() && online()) MapboxRest.countryAt(mbToken, LL(lat, lon)) else null)
             }
             if (cc == null) { countryChecked = false; return@launch }
             val up = cc.uppercase()
@@ -1516,6 +1527,9 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
 
     /** A sample beep, at the chime volume just set (Settings). */
     fun testChime() { if (soundMode != 2) guidanceBeep(false) }
+    fun testSpeedAlert(kind: String) { if (soundMode != 2) guidanceBeep(true, kind) }
+    /** A short line said as the voice is turned up, so the new level can be heard. */
+    fun testVoice() { if (soundMode != 2) speak(L.t("You have arrived"), true) }
 
     // one tone generator, kept and reused: making a new one for every beep leaked audio resources and caused hiccups over time
     private var toneGen: android.media.ToneGenerator? = null
@@ -1530,6 +1544,36 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         // the strength set by "Chime volume"
         guidanceBeep(tone == android.media.ToneGenerator.TONE_PROP_BEEP2)
     }
+
+    /** The over-the-limit and top-speed alert, in the sound chosen in Settings › Alerts › Speed alert sound (ILDEMONICO, #335). */
+    private fun speedChime() {
+        if (soundMode == 2 || quiet()) return
+        guidanceBeep(true, prefs.s(PreferenceKeys.SPEED_ALERT_SOUND, "double"))
+    }
+
+    // the speed alert's other sounds: a rising three-note siren, or a low double buzz, clearly unlike the camera and hazard beeps
+    private fun alertPcm(kind: String): ShortArray {
+        val rate = 22050
+        val notes = if (kind == "siren") listOf(700.0 to 120, 1000.0 to 120, 1400.0 to 160) else listOf(330.0 to 200, 330.0 to 200)
+        val gap = rate * 50 / 1000
+        val total = notes.sumOf { rate * it.second / 1000 } + gap * (notes.size - 1)
+        val out = ShortArray(total)
+        var at = 0
+        for ((i, nt) in notes.withIndex()) {
+            val len = rate * nt.second / 1000
+            for (j in 0 until len) {
+                val env = minOf(1.0, minOf(j, len - j).toDouble() / (rate * 0.008))
+                val x = Math.sin(2.0 * Math.PI * nt.first * j / rate)
+                // (the buzz is a squared-off wave so it sounds harsher)
+                val w = if (kind == "siren") x else Math.signum(x) * 0.8 + x * 0.2
+                out[at + j] = (w * env * 0.55 * Short.MAX_VALUE).toInt().toShort()
+            }
+            at += len + (if (i < notes.size - 1) gap else 0)
+        }
+        return out
+    }
+    private val alertSiren by lazy { alertPcm("siren") }
+    private val alertBuzz by lazy { alertPcm("buzz") }
 
     // the beep's sound, made once: a short 1 kHz tone (twice for a warning), faded in and out so it doesn't click
     private fun beepPcm(double: Boolean): ShortArray {
@@ -1551,14 +1595,14 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     @Volatile private var beepBusy = false
 
     /** A beep on the voice's channel (navigation, or media if chosen), with the music lowered for it. */
-    private fun guidanceBeep(double: Boolean) {
+    private fun guidanceBeep(double: Boolean, kind: String = "double") {
         if (beepBusy) return
         beepBusy = true
         scope.launch(Dispatchers.Default) {
             var tr: android.media.AudioTrack? = null
             var fr: android.media.AudioFocusRequest? = null
             try {
-                val pcm = if (double) beepDouble else beepSingle
+                val pcm = when { kind == "siren" -> alertSiren; kind == "buzz" -> alertBuzz; double -> beepDouble; else -> beepSingle }
                 val attrs = android.media.AudioAttributes.Builder()
                     .setUsage(voiceUsage)
                     .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
@@ -1720,6 +1764,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             appendLine("Install record: ${Updater.installRecord(ctx)}")
             try { RouteEnds.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Last routes ended:"); append(it) } } catch (e: Throwable) { }
             try { com.headunit.launcher.car.CarCardLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Car search card closed:"); append(it) } } catch (e: Throwable) { }
+            try { VoiceLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Last spoken directions:"); append(it) } } catch (e: Throwable) { }
             try { SoundLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Music lowered and given back:"); append(it) } } catch (e: Throwable) { }
             try { NetHealth.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Connection problems:"); append(it) } } catch (e: Throwable) { }
             try { BgLog.text().takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("In the background today:"); append(it) } } catch (e: Throwable) { }
@@ -1734,11 +1779,19 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     /** A few car parks close to where you're going, offered about a mile before you arrive. */
     var parkingNear by mutableStateOf<List<Nearby>>(emptyList())
     private var parkingFor: Route? = null
+    // (a look that found nothing, because the map service didn't answer, is tried again, up to 3 times about 40 seconds apart: it used to
+    // be tried once per route, so one failed look meant no car parks for the rest of the trip, Dotancom #324)
+    private var parkingTries = 0
+    private var parkingTriesRoute: Route? = null
+    private var parkingTryAt = 0L
 
     private fun checkParking(r: Route, rem: Double) {
         if (parkingFor === r || rem > 1700.0 || rem < 150.0 || r.len < 3000.0 || previewing || !prefs.b(PreferenceKeys.PARKPROMPT, true)) return
+        if (parkingTriesRoute !== r) { parkingTriesRoute = r; parkingTries = 0 }
+        if (System.currentTimeMillis() - parkingTryAt < 40_000L) return
         val d = dest ?: return
         parkingFor = r
+        parkingTries++; parkingTryAt = System.currentTimeMillis()
         // going to a car park already: nothing to offer
         val nm = d.name.lowercase()
         if (nm.contains("parking") || nm.contains("car park") || nm.contains("multi-storey") || nm.contains("multistorey")) return
@@ -1749,7 +1802,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                 (osm.takeIf { it.isNotEmpty() } ?: (if (hasOnline && online()) try { netPoiNearby("parking", d.pos, 700) } catch (e: Exception) { null } else null) ?: emptyList())
                     .map { it.copy(dist = Geo.dist(d.pos, it.place.pos)) }.filter { it.dist < 800.0 }.sortedBy { it.dist }.take(3)
             }
-            if (route === r && dest === d) parkingNear = list
+            if (route === r && dest === d) {
+                parkingNear = list
+                // nothing found: let the next check have another go (after the pause above), a few times at most
+                if (list.isEmpty() && parkingTries < 3 && parkingFor === r) parkingFor = null
+            }
         }
     }
 
@@ -3162,7 +3219,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         // (what ended a trip under way, for the problem report: a route that ends by itself, as on carlb051's Home button, #226)
         if (route != null && !previewing) try { RouteEnds.note(ctx, if (isCar) "car" else "phone", dest?.let { d ->
             // (which kind of place only: the report never carries places)
-            when { places.slot("home")?.let { Geo.dist(it.pos, d.pos) < 60.0 } == true -> "home"; places.slot("work")?.let { Geo.dist(it.pos, d.pos) < 60.0 } == true -> "work"; else -> "other" } }.orEmpty()) } catch (e: Throwable) { }
+            when { places.slot("home")?.let { Geo.dist(it.pos, d.pos) < 60.0 } == true -> "home"; places.slot("work")?.let { Geo.dist(it.pos, d.pos) < 60.0 } == true -> "work"; else -> "other" } }.orEmpty(), arrivedWhy); arrivedWhy = "" } catch (e: Throwable) { }
         stopTrackDrive()
         shortRoute = false
         demoNext = false
@@ -3250,7 +3307,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         northUp = !northUp
         // remembered for next time, on the phone / head unit and Android Auto separately (GitHub #27)
         try { prefs.put(if (isCar) PreferenceKeys.NORTH_UP_CAR else PreferenceKeys.NORTH_UP, northUp) } catch (e: Exception) { }
-        if (northUp) map.resetNorth() else fix?.let { onPosition(it, true) }
+        if (northUp) { compassDeg = 0.0; map.resetNorth() } else fix?.let { onPosition(it, true) }
     }
 
     fun toggleTilt() {
@@ -3477,7 +3534,21 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             if (lim == null || p.speed <= lim || lim != beepLim) { beepArmed = true; beepLim = lim }
             if (over && beepArmed && soundMode != 2 && prefs.b(PreferenceKeys.LIMIT_SOUNDS, true) && now - lastBeep > 9000) {
                 lastBeep = now; beepArmed = false
-                chime(android.media.ToneGenerator.TONE_PROP_BEEP2)
+                speedChime()
+                // Settings › Alerts › Say "Slow down": the words after the beep, for those who find a beep alone easy to ignore (#345)
+                if (prefs.b(PreferenceKeys.SAY_SLOW_DOWN, false)) scope.launch { delay(450); speak(L.t("Slow down"), true) }
+            }
+            // a top speed of your own (Settings › Alerts › Top speed): a beep and "Slow down" once as you reach it, again after you've
+            // dropped 5 below it, whatever the limit says
+            val top = (prefs.s(PreferenceKeys.ALERT_TOP_SPEED, "0").toIntOrNull() ?: 0) * (if (imperial) 0.44704 else 0.27778)
+            if (top > 0) {
+                if (p.speed < top - (if (imperial) 2.2 else 1.4)) topArmed = true
+                else if (p.speed >= top && topArmed && soundMode != 2 && now - lastBeep > 4000) {
+                    topArmed = false; lastBeep = now
+                    speedChime()
+                    scope.launch { delay(450); speak(L.t("Slow down"), true) }
+                    raiseAlert("limit", L.t("Top speed {0} reached", prefs.s(PreferenceKeys.ALERT_TOP_SPEED, "0")))
+                }
             }
         }
         try { refreshRoad() } catch (e: Exception) { }
@@ -3789,7 +3860,8 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                         }
                     } else Overpass.nearby(kind, centre, radius).map { it.copy(dist = Geo.dist(origin, it.place.pos)) }
                 }
-                val list = kotlinx.coroutines.withTimeoutOrNull(30_000L) { work.await() }
+                val found = kotlinx.coroutines.withTimeoutOrNull(30_000L) { work.await() }
+                val list = if (kind == "charging") found?.let { filterChargers(it) } else found
                 if (list == null) { work.cancel(); toast(L.t("Search took too long. Check the signal and try again."), 4000); clearNearby(); return@launch }
                 if (pickBest) {
                     val ahead = list.filter { it.ahead || route == null }
@@ -3983,6 +4055,27 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
 
     /** Rough extra minutes to call somewhere [off] metres from the route: there and back at town speed, plus a minute. */
     private fun detour(off: Double): Int = Math.round((2.0 * off / 11.0 + 60.0) / 60.0).toInt()
+
+    /** The charger filter from Settings, as one line for the list ("50 kW+ · Ionity, Tesla"), or empty when none is set (Seali7Aut, #343). */
+    fun chargerFilterText(): String {
+        val kw = prefs.i(PreferenceKeys.EV_MIN_KW, 0)
+        val names = prefs.s(PreferenceKeys.EV_PROVIDERS, "").split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        return listOfNotNull(if (kw > 0) "$kw kW+" else null, if (names.isNotEmpty()) names.joinToString(", ") else null).joinToString(" · ")
+    }
+
+    /** Drops chargers known to be slower than the wanted speed, or from other providers. A charger whose speed isn't known stays. */
+    private fun filterChargers(l: List<Nearby>): List<Nearby> {
+        val minKw = prefs.i(PreferenceKeys.EV_MIN_KW, 0)
+        val names = prefs.s(PreferenceKeys.EV_PROVIDERS, "").split(',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        if (minKw <= 0 && names.isEmpty()) return l
+        val kwRe = Regex("(\\d+(?:\\.\\d+)?)\\s*kW", RegexOption.IGNORE_CASE)
+        return l.filter { n ->
+            val kw = kwRe.find(n.extra)?.groupValues?.get(1)?.toDoubleOrNull()
+            val fastEnough = minKw <= 0 || kw == null || kw >= minKw
+            val text = (n.place.name + " " + n.place.sub + " " + n.extra).lowercase()
+            fastEnough && (names.isEmpty() || names.any { it in text })
+        }
+    }
 
     private fun sortNearby(l: List<Nearby>): List<Nearby> =
         if (nearbySort == "cheap" && l.any { it.price != null }) l.sortedWith(compareBy<Nearby> { it.price ?: 9999.0 }.thenBy { it.dist }) else l.sortedBy { it.dist }
@@ -4279,6 +4372,8 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         }
         val gp = gPos ?: return
         map.setMe(gp, gHead, 0)
+        val facing = if (northUp || !following) 0.0 else lookB
+        if (abs(angDiff(compassDeg, facing)) >= 3.0) compassDeg = facing
         if (glideOnRoute && r != null && !previewing) {
             if (now - gDoneAt >= (if (following) 350L else 1500L)) { gDoneAt = now; updateDone(r, gProg) }
         } else if (doneShown) { map.setDone(emptyList()); doneShown = false }
@@ -4522,6 +4617,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             if (i1 > i0) map.setMainOnly(r.pts.subList(i0, i1 + 1), r.sev, i0)
         }
         // off the route, the distance along it stays where you left it (until the new route comes) instead of following the nearest bit
+        // The distance along the route is moved on by the glide loop, which runs on the phone's screen refreshes. With the phone's
+        // screen off while Android Auto is on, those can stop or come only now and then, and the directions were worked out from
+        // where you'd been a while back: the call for a turn came after you'd made it, as you set off along the next road, and
+        // the countdown to the next turn never came. When the loop hasn't moved it lately, each fix moves it on instead
+        if (onR && android.os.SystemClock.elapsedRealtime() - gGuideAt > 1500L && mProg > gProg) gProg = min(mProg, r.len)
         val guideProg = if (onR) gProg else if (!jump && s.dist <= offLim) s.progress else if (trustProg >= 0.0) trustProg else s.progress
         onRouteNow = onR
         if (onR) curProg = guideProg
@@ -5045,9 +5145,9 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     class Report(val kind: String, val pos: LL, val t: Long)
 
     /** How long each kind of report lasts, its map icon, and what is said when you come up to it. */
-    private fun reportLife(k: String) = when (k) { "hazard" -> 3_600_000L; "accident", "breakdown" -> 2 * 3_600_000L; "mobilecam" -> 4 * 3_600_000L; else -> 3 * 3_600_000L }
-    private fun reportIcon(k: String) = when (k) { "accident" -> 4; "hazard" -> 5; "breakdown" -> 6; "mobilecam" -> 7; else -> 3 }
-    fun reportName(k: String) = when (k) { "accident" -> "Accident"; "hazard" -> "Hazard"; "breakdown" -> "Broken-down vehicle"; "mobilecam" -> "Mobile speed camera"; else -> "Police" }
+    private fun reportLife(k: String) = when (k) { "hazard", "traffic" -> 3_600_000L; "accident", "breakdown" -> 2 * 3_600_000L; "mobilecam" -> 4 * 3_600_000L; else -> 3 * 3_600_000L }
+    private fun reportIcon(k: String) = when (k) { "accident" -> 4; "hazard" -> 5; "breakdown" -> 6; "mobilecam" -> 7; "traffic" -> 8; else -> 3 }
+    fun reportName(k: String) = when (k) { "accident" -> "Accident"; "hazard" -> "Hazard"; "breakdown" -> "Broken-down vehicle"; "mobilecam" -> "Mobile speed camera"; "traffic" -> "Traffic jam"; else -> "Police" }
 
     /** Reports still in force (older police-only reports are read too). */
     fun reportsActive(): List<Report> {
@@ -6163,7 +6263,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             val span = max(1.0, d.end - d.off)
             d.secs * ((d.end - max(p, d.off)) / span).coerceIn(0.0, 1.0)
         }
-        return r.freeFlow * frac + ahead
+        return NavigationPolicy.remainingSegmentTime(r.cum, r.segmentTimes, p) ?: (r.freeFlow * frac + ahead)
     }
 
     private var etaSmoothSecs = -1.0
@@ -6198,7 +6298,12 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                 d.secs * ((d.end - max(progress, d.off)) / span).coerceIn(0.0, 1.0)
             }
             val ahead2 = ahead + incAhead
-            var secs = r.freeFlow * frac + ahead2
+            // Mapbox supplies a duration for each road segment. Sum the time still ahead on those segments rather than
+            // spreading the whole route's free-flow time evenly by distance (which made ETA wrong on mixed-speed roads).
+            // Those segment durations already include traffic, so add only separately detected incident delays here.
+            val segmentRemaining = NavigationPolicy.remainingSegmentTime(r.cum, r.segmentTimes, progress)
+            var secs = (segmentRemaining ?: (r.freeFlow * frac + ahead)) + incAhead
+            // Keep the delay figure separate from travel time; it is the traffic delay still ahead, not a second addition.
             var delayMin = Math.round(ahead2 / 60.0).toInt()
             // TomTom's own timing of this road (a Mapbox route with a TomTom key): the longer of the two is used
             ttTiming?.takeIf { it.route === r && it.span > 0 }?.let { t ->
@@ -6336,11 +6441,13 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             val familiar = prefs.b(PreferenceKeys.SMARTVOICE, true) && onRoad.isNotBlank() && (roadFam[onRoad] ?: 0) >= 6
             val fFrom = if (familiar) 330.0 else 520.0
             // a heads-up well ahead on fast roads, then the main call-out, then the final one at the junction
-            if (!familiar && d <= 1700 && d > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e"))
+            // (each call is noted for the problem report, with how far the GPS itself put you from the turn)
+            fun logCall(which: String) = VoiceLog.note(ctx, "${if (isCar) "car" else "phone"} · ${which} · said at ${Math.round(d)} m · GPS ${Math.round(cur.off - mProg)} m · loop ${android.os.SystemClock.elapsedRealtime() - gGuideAt} ms ago")
+            if (!familiar && d <= 1700 && d > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e").also { if (it) logCall("early") })
                 speak(L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase))
-            if (d <= fFrom && d > 200 && said.add("${sk}f"))
+            if (d <= fFrom && d > 200 && said.add("${sk}f").also { if (it) logCall("countdown") })
                 speak(if (lmPhrase.isNotEmpty()) lmPhrase + lane else if (arriving) L.t("In {0}, you will arrive", Geo.spoken(d, imperial)) + (if (side.isNotEmpty()) ". " + L.t("Your destination is on the $side") else "") else L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase) + lane)
-            if (d <= 120 && said.add("${sk}n"))
+            if (d <= 120 && said.add("${sk}n").also { if (it) logCall("at the turn") })
                 speak(if (arriving) (if (side.isNotEmpty()) L.t("Your destination is on the $side") else L.t("You have arrived")) else if (lmPhrase.isNotEmpty()) lmPhrase else phrase.replaceFirstChar { it.uppercase() })
         }
         // a route that stops short of the destination (the downloaded map ran out): at its end, plan on from here instead
@@ -6370,6 +6477,10 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         val atEnd = nearEnd || parked || (atDoor && nowP - atDoorSince > 15_000L)
         if (atEnd && said.add("end")) {
             toast(L.t("You have arrived"), 5000)
+            // (why it counted as arrived, for the problem report: distances only, never places; carlb051, #360)
+            arrivedWhy = "arrived: " + listOf(if (nearEnd) "end of route" else "", if (parked) "parked near" else "", if (atDoor) "stopped at the door" else "").filter { it.isNotEmpty() }.joinToString("+") +
+                " · route " + Math.round(r.len) + " m, " + Math.round(rem) + " m left, " + (f0?.let { Math.round(Geo.dist(it.pos, dest?.pos ?: r.pts.last())).toString() + " m from the destination" } ?: "no GPS fix") +
+                ", started " + (if (navStartMs > 0) ((System.currentTimeMillis() - navStartMs) / 1000).toString() + " s ago" else "unknown")
             if (navStartMs > 0) {
                 val secsT = (System.currentTimeMillis() - navStartMs) / 1000.0
                 val dd = max(0.0, tripDist - navStartDist)
@@ -6400,6 +6511,8 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     /** When you stopped near the destination (0 = not stopped there), for arriving in a big car park. */
     private var parkedSince = 0L
     private var atDoorSince = 0L
+    /** What made the last arrival count, kept for the problem report's list of how trips ended. */
+    private var arrivedWhy = ""
 
     // ---- live rain radar ----
     private var radarJob: Job? = null
@@ -7007,7 +7120,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         }
         // reports
         if (t.startsWith("report")) {
-            val k = when { has("police", "cop") -> "police"; has("accident", "crash") -> "accident"; has("breakdown", "broken") -> "breakdown"; has("camera") -> "mobilecam"; else -> "hazard" }
+            val k = when { has("police", "cop") -> "police"; has("accident", "crash") -> "accident"; has("breakdown", "broken") -> "breakdown"; has("camera") -> "mobilecam"; has("traffic", "jam") -> "traffic"; else -> "hazard" }
             report(k); return ""
         }
         // finding things
@@ -7466,6 +7579,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     private class ViaItem(val id: String, val file: java.io.File, var ready: Boolean = false, var failed: Boolean = false, val text: String)
     private val viaQueue = java.util.ArrayDeque<ViaItem>()
     private var viaPlayer: android.media.MediaPlayer? = null
+    private var viaGain: android.media.audiofx.LoudnessEnhancer? = null
     private var viaSeq = 0
     /** The app is making or playing a spoken line (counts as speaking for giving the music back). */
     @Volatile private var viaBusy = false
@@ -7521,8 +7635,13 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             mp.setOnCompletionListener { finishVia(it, item.file) }
             mp.setOnErrorListener { m, _, _ -> finishVia(m, item.file); true }
             mp.prepare()
+            // Settings › Sound & voice › Voice boost: louder than the audio's own level, for voices that come out quietly. The
+            // enhancer limits the peaks rather than letting them clip
+            val gainDb = prefs.i(PreferenceKeys.VOICE_GAIN, 0).coerceIn(0, 18)
+            if (gainDb > 0) try { viaGain = android.media.audiofx.LoudnessEnhancer(mp.audioSessionId).apply { setTargetGain(gainDb * 100); setEnabled(true) } } catch (e: Throwable) { }
             mp.start()
         } catch (e: Exception) {
+            releaseViaGain()
             viaPlayer?.let { try { it.release() } catch (x: Exception) { } }
             viaPlayer = null
             try { item.file.delete() } catch (x: Exception) { }
@@ -7530,7 +7649,10 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         }
     }
 
+    private fun releaseViaGain() { try { viaGain?.release() } catch (e: Throwable) { }; viaGain = null }
+
     private fun finishVia(mp: android.media.MediaPlayer, file: java.io.File) {
+        releaseViaGain()
         try { mp.release() } catch (e: Exception) { }
         if (viaPlayer === mp) viaPlayer = null
         try { file.delete() } catch (e: Exception) { }
@@ -7556,6 +7678,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
     private fun stopViaPlayer() {
         val mp = viaPlayer ?: return
         viaPlayer = null
+        releaseViaGain()
         try { mp.stop() } catch (e: Exception) { }
         try { mp.release() } catch (e: Exception) { }
     }

@@ -5,6 +5,8 @@ import kotlin.math.max
 import kotlin.math.min
 import java.util.Locale
 import android.content.Context
+import android.content.ComponentCallbacks2
+import android.content.res.Configuration
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import android.graphics.Bitmap
@@ -98,7 +100,7 @@ import com.mapbox.android.gestures.StandardScaleGestureDetector
  * - Asking the map what is on screen is asynchronous in Mapbox and never blocks the app; each question also has a time limit,
  *   so a map that isn't drawing (hidden, in the background) can't leave anything waiting.
  */
-class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1f, ratio: Float = 0f) : DefaultLifecycleObserver {
+class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1f, ratio: Float = 0f) : DefaultLifecycleObserver, ComponentCallbacks2 {
     val mapView: MapView
     private val mbMap: MapboxMap get() = mapView.mapboxMap
     private val prefs = Prefs(ctx)
@@ -173,6 +175,9 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
             mapView.gestures.rotateEnabled = true
             mapView.gestures.pitchEnabled = true
         } catch (e: Throwable) { }
+        // two fingers moved up or down tilt the map even when they aren't held level: Mapbox only counts it as a tilt within 20
+        // degrees of level, so most tries moved the map instead (ILDEMONICO, GitHub #335)
+        try { mapView.gestures.getGesturesManager().shoveGestureDetector.setMaxShoveAngle(40f) } catch (e: Throwable) { }
         // counted all the time: the automatic frame rate compares frames drawn with camera moves asked for
         subs += mbMap.subscribeRenderFrameStarted { PerfStats.renders++ }
         subs += mbMap.subscribeMapLoadingError { e ->
@@ -229,6 +234,9 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
         }
         subs += mbMap.subscribeMapIdle { placeAltCards(true); refreshLamps(); refreshSignals(); refreshRoads() }
         installTapSelect()
+        // Mapbox must receive Android's memory-pressure callbacks; otherwise native/GPU tile caches
+        // can retain memory after the system has started reclaiming it.
+        try { ctx.applicationContext.registerComponentCallbacks(this) } catch (e: Exception) { }
     }
 
     /** This map is the car screen's (Android Auto): no app top bar there to keep the logo clear of. */
@@ -289,12 +297,25 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
     fun carResume() { if (started) return; try { mapView.onStart() } catch (e: Throwable) { }; started = true; try { flowAnim?.resume() } catch (e: Exception) { } }
     override fun onDestroy(owner: LifecycleOwner) = destroy()
 
+    override fun onConfigurationChanged(newConfig: Configuration) { }
+
+    override fun onLowMemory() {
+        if (!destroyed) try { mapView.onLowMemory() } catch (e: Throwable) {
+            android.util.Log.w("MapBinding", "Mapbox low-memory trim failed", e)
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) onLowMemory()
+    }
+
     /** Stops everything and frees the map (the car screen calls this when it goes away). */
     @Synchronized
     fun destroy() {
         if (destroyed) return
         destroyed = true
         started = false
+        try { ctx.applicationContext.unregisterComponentCallbacks(this) } catch (e: Exception) { }
         try { lightHandler.removeCallbacksAndMessages(null) } catch (e: Throwable) { }
         try { lampExec.shutdownNow() } catch (e: Throwable) { }
         try { signalExec.shutdownNow() } catch (e: Throwable) { }
@@ -610,13 +631,15 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
                     val wet = o.weatherLight && (raining() || snowing())
                     lightJson(if (wet) "#DCE0E6" else "#F2F4F7", (if (wet) 0.86 else 0.92) * kd, "#FFFFFF", 0.08 * kd, 180.0, 30.0, false, 0.0)
                 } else {
-                    var az = 180.0; var polar = 30.0
+                    var az = 180.0; var polar = 30.0; var sunUp = 1.0
                     if (o.sunReal) try {
                         val c = mbMap.cameraState.center
                         val (a, el) = Sun.position(c.latitude(), c.longitude(), System.currentTimeMillis())
                         az = a; polar = (90.0 - el).coerceIn(15.0, 75.0)
+                        // after sunset the sun's light and shadows fade out over the last few degrees, instead of staying on all evening (ILDEMONICO, #335)
+                        sunUp = (el / 8.0).coerceIn(0.0, 1.0)
                     } catch (e: Throwable) { }
-                    lightJson("#FFFFFF", 0.8 * kd, "#FFFFFF", 0.2 * kd, az, polar, o.shadows, 0.3)
+                    lightJson("#FFFFFF", 0.8 * kd, "#FFFFFF", 0.2 * kd * sunUp, az, polar, o.shadows && sunUp > 0.0, 0.3 * sunUp)
                 }
             }
             else -> null
@@ -2536,6 +2559,7 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
         if (!slotsOn && (hzFamily() || recolourBase)) try { recolourClassic(st) } catch (e: Throwable) { }
         // Standard's newer settings are set once it's loaded (so a style that doesn't know one can't stop the map loading)
         if (!satellite) {
+            setBase("show3dObjects", Value.valueOf(buildings3d && MapStylePolicy.supportsFullDetailFeatures(mapDetail)))
             setBase("show3dTrees", Value.valueOf(treesOn)); setBase("showLandmarkIcons", Value.valueOf(!lite))
             // lane markings, turn arrows, stop lines and 3D overpasses where Mapbox has them (Full 3D only)
             setBase("showHdRoads", Value.valueOf(hdRoadsOn && MapStylePolicy.supportsFullDetailFeatures(mapDetail)))
@@ -2584,7 +2608,7 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
         // lane bands: each lane drawn as a strip along the road before a junction, the lane(s) you need lit, the others dimmed, with dashed dividers
         addS(st, GeoJsonSource.Builder("dl-lane-bands").featureCollection(empty()).build())
         addS(st, GeoJsonSource.Builder("dl-lane-divs").featureCollection(empty()).build())
-        fun ln(id: String, src: String) = LineLayer(id, src).inSlot(MID).lineEmissiveStrength(1.0).lineCap(LineCap.ROUND).lineJoin(LineJoin.ROUND)
+        fun ln(id: String, src: String, slot: String = MID) = LineLayer(id, src).inSlot(slot).lineEmissiveStrength(1.0).lineCap(LineCap.ROUND).lineJoin(LineJoin.ROUND)
         // average speed zones on the route: the stretch between the cameras shaded yellow, with dashed yellow edges (under the route)
         addS(st, GeoJsonSource.Builder("dl-avg").featureCollection(FeatureCollection.fromFeatures(avgZoneLines.filter { it.size >= 2 }.map { line(it) })).build())
         val bandW = zoomed(2.0, 12 to 8.0, 16 to 30.0, 20 to 480.0)
@@ -2658,19 +2682,6 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
             .iconOpacity(0.75).iconEmissiveStrength(1.0)
             .iconSize(zoomed(1.0, 15 to 0.28, 18 to 0.5, 20 to 0.7))
             .minZoom(15.0).visibility(vis(chevOn)))
-        // the turn arrow: (by day) a soft dark halo so it stands out on the light map, a dark edge, a white shaft and a white head
-        if (dayLook) addL(st, ln("dl-turn-soft", "dl-turn").lineColor("#16467A").lineWidth(routeW(1.62f)).lineBlur(routeW(0.3f)).lineOpacity(0.35).minZoom(13.0))
-        addL(st, ln("dl-turn-case", "dl-turn").lineColor("#16467A").lineWidth(routeW(1.28f)).minZoom(13.0))
-        addL(st, ln("dl-turn-line", "dl-turn").lineColor("#FFFFFF").lineWidth(routeW(1.08f)).minZoom(13.0))
-        addImg(st, "dl-turn-head-img", turnHeadBitmap(dayLook))
-        addL(st, SymbolLayer("dl-turn-head", "dl-turn-head").inSlot(MID)
-            .iconImage("dl-turn-head-img").iconRotate(Expression.get("b"))
-            .iconRotationAlignment(IconRotationAlignment.MAP).iconPitchAlignment(IconPitchAlignment.MAP)
-            .iconAllowOverlap(true).iconIgnorePlacement(true).iconEmissiveStrength(1.0)
-            // the head's base sits exactly on the end of the shaft, and grows with the zoom the same way the line does
-            .iconAnchor(IconAnchor.BOTTOM)
-            .iconSize(zoomed(1.7, 10 to headSize(3f), 13 to headSize(6.5f), 15 to headSize(10f), 17 to headSize(16f), 19 to headSize(24f)))
-            .minZoom(13.0))
         // the part of the route you have already driven turns grey, drawn over the blue
         addL(st, ln("dl-done-casing", "dl-done").lineColor(if (im) "#B4B9CE" else "#C3C8D8").lineWidth(routeW(if (im) 1.5f else 1.25f)).lineOpacity(0.9).lineCap(LineCap.BUTT))
         addL(st, ln("dl-done-line", "dl-done").lineColor(if (im) "#7E849F" else "#8C92AC").lineWidth(routeW(if (im) 1.0f else 0.85f)).lineCap(LineCap.BUTT))
@@ -2701,6 +2712,19 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
             addL(st, l)
             if (on == 1) lanesOnLayer = l
         }
+        // Keep the entire turn arrow above the route x-ray (in Standard's top slot) and lane overlays; classic uses insertion order.
+        if (dayLook) addL(st, ln("dl-turn-soft", "dl-turn", TOP).lineColor("#16467A").lineWidth(routeW(1.62f)).lineBlur(routeW(0.3f)).lineOpacity(0.35).minZoom(13.0))
+        addL(st, ln("dl-turn-case", "dl-turn", TOP).lineColor("#16467A").lineWidth(routeW(1.28f)).minZoom(13.0))
+        addL(st, ln("dl-turn-line", "dl-turn", TOP).lineColor("#FFFFFF").lineWidth(routeW(1.08f)).minZoom(13.0))
+        addImg(st, "dl-turn-head-img", turnHeadBitmap(dayLook))
+        addL(st, SymbolLayer("dl-turn-head", "dl-turn-head").inSlot(TOP)
+            .iconImage("dl-turn-head-img").iconRotate(Expression.get("b"))
+            .iconRotationAlignment(IconRotationAlignment.MAP).iconPitchAlignment(IconPitchAlignment.MAP)
+            .iconAllowOverlap(true).iconIgnorePlacement(true).iconEmissiveStrength(1.0)
+            // the head's base sits exactly on the end of the shaft, and grows with the zoom the same way the line does
+            .iconAnchor(IconAnchor.BOTTOM)
+            .iconSize(zoomed(1.7, 10 to headSize(3f), 13 to headSize(6.5f), 15 to headSize(10f), 17 to headSize(16f), 19 to headSize(24f)))
+            .minZoom(13.0))
         // street lamps (3D models, see StreetLamps below); and the road data used for lamps and road snapping
         installLamps(st)
         installRoadData(st)
@@ -3432,8 +3456,8 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
     /** The route's badges' size by zoom, times each one's own scale ("sc": the camera size setting for speed cameras, 1 for the rest). */
     private val HAZ_SIZE = "[\"interpolate\",[\"linear\"],[\"zoom\"]," +
         listOf(11 to 0.45, 15 to 0.75, 18 to 1.0).joinToString(",") { (z, v) -> "$z,[\"*\",$v,[\"coalesce\",[\"get\",\"sc\"],1]]" } + "]"
-    /** Map icons by kind: camera, roadworks, closure, police, accident, hazard, breakdown, mobile camera. */
-    private val hazardNames = arrayOf("dl-hz-cam", "dl-hz-work", "dl-hz-closed", "dl-hz-police", "dl-hz-accident", "dl-hz-hazard", "dl-hz-breakdown", "dl-hz-mobilecam")
+    /** Map icons by kind: camera, roadworks, closure, police, accident, hazard, breakdown, mobile camera, traffic jam. */
+    private val hazardNames = arrayOf("dl-hz-cam", "dl-hz-work", "dl-hz-closed", "dl-hz-police", "dl-hz-accident", "dl-hz-hazard", "dl-hz-breakdown", "dl-hz-mobilecam", "dl-hz-traffic")
 
     /** Icons for speed cameras (0), roadworks (1) and closures (2) along the route. */
     fun setHazards(list: List<Pair<LL, Int>>) { hazards = list; pushHazards() }
@@ -3527,6 +3551,11 @@ class MapBinding(private val ctx: Context, fast: Boolean = false, res: Float = 1
                 c.drawRoundRect(android.graphics.RectF(cx - 11f, cx - 13f, cx + 11f, cx - 2f), 5f, 5f, p(0xFFFFFFFF.toInt()))
                 c.drawCircle(cx - 10f, cx + 11f, 4.5f, p(0xFF37474F.toInt()))
                 c.drawCircle(cx + 10f, cx + 11f, 4.5f, p(0xFF37474F.toInt()))
+            }
+            8 -> {
+                badge(0xFF7F1020.toInt(), 0xFFC62839.toInt(), "")
+                // a queue: three cars nose to tail
+                for (dx in floatArrayOf(-20f, -3f, 14f)) c.drawRoundRect(android.graphics.RectF(cx + dx - 6f, cx - 8f, cx + dx + 6f, cx + 9f), 3f, 3f, p(0xFFFFFFFF.toInt()))
             }
             7 -> {
                 c.drawCircle(cx, cx + 2f, 38f, p(0x55000000))

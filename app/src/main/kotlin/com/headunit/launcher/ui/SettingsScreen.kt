@@ -404,6 +404,15 @@ private fun LightSection(prefs: Prefs) {
         SToggle(prefs, L.t("Sun in its real place"), PreferenceKeys.SUN_REAL, false, L.t("Light and shadows come from where the sun really is right now, and at night from the moon"))
         // (Overcast light is in Settings > Weather, with everything else the weather changes)
     }
+    SGroup(L.t("Map buttons"), footer = L.t("Map options is always there. Overview shows the whole route for a few seconds, then goes back to following you")) {
+        val hidden = prefs.s(PreferenceKeys.RAIL_HIDDEN, "overview").split(",").filter { it.isNotBlank() }
+        listOf("compass" to L.t("Compass"), "report" to L.t("Report"), "sound" to L.t("Sound (while navigating)"), "routes" to L.t("Other routes (while navigating)"),
+            "clean" to L.t("Clean view (while navigating)"), "overview" to L.t("Overview (while navigating)")).forEach { (id, name) ->
+            val on = id !in hidden
+            val set = { v: Boolean -> prefs.put(PreferenceKeys.RAIL_HIDDEN, (if (v) hidden - id else (hidden + id).distinct()).joinToString(",").ifEmpty { "none" }) }
+            SItem(name, onClick = { set(!on) }) { Switch(on, { set(it) }) }
+        }
+    }
     // everything that sets the map's angle in one place (the switches below were in Turn card & lanes and On the map, where the
     // flat view when stopped wasn't found: bluelions25, #312)
     SGroup(L.t("Map view"), footer = L.t("Tilt: 30° to 65°. Auto is the app's own choice (54°, or 52° with a lighter map). Tilt with speed and flattening at turns still work on top.")) {
@@ -524,7 +533,8 @@ private fun ArrowSection(prefs: Prefs, engine: NavEngine) {
         val own = OwnModel.info(prefs)
         val pickModel = rememberModelPicker(prefs) { why ->
             if (why == null) prefs.put(PreferenceKeys.MODEL_SHAPE, "own")
-            else android.widget.Toast.makeText(ctx, L.t("That file isn't a .glb 3D model (or it's over 8 MB)"), android.widget.Toast.LENGTH_LONG).show()
+            else android.widget.Toast.makeText(ctx, if (why == "too big") L.t("That model is too big, even with its pictures made smaller. Lower its polygon count (in the app that made it, or Blender's Decimate) and try again")
+                else L.t("That file isn't a .glb 3D model"), android.widget.Toast.LENGTH_LONG).show()
         }
         fun chooseModel() { if (!pickModel()) android.widget.Toast.makeText(ctx, L.t("No app on this unit can pick a file (try installing a file manager)"), android.widget.Toast.LENGTH_LONG).show() }
         if (loc == "model") {
@@ -533,7 +543,7 @@ private fun ArrowSection(prefs: Prefs, engine: NavEngine) {
             }
             if (prefs.s(PreferenceKeys.MODEL_SHAPE, "arrow") == "own" && own != null) {
                 SItem(L.t("3D model file"), own.first + " · " + String.format(java.util.Locale.UK, "%.1f MB", own.second / (1024.0 * 1024.0))) { SButton(L.t("Change")) { chooseModel() } }
-                SNote(L.t("A .glb up to 8 MB. Point it the way you drive with Turn; over 3 MB it may stutter on slower head units"))
+                SNote(L.t("A .glb model. Over 8 MB, its pictures are made smaller so it fits. Point it the way you drive with Turn; over 3 MB it may stutter on slower head units"))
                 if (engine.map.ownFailed) SNote(L.t("Your 3D model couldn't be shown, so the built-in car is used"))
                 SSlider(L.t("Turn"), prefs.s(PreferenceKeys.MODEL_TURN, "0").toFloatOrNull() ?: 0f, 0f..345f, "°", steps = 22, reset = 0f) { prefs.put(PreferenceKeys.MODEL_TURN, it.toString()) }
             }
@@ -815,6 +825,12 @@ private fun AlertsSection(prefs: Prefs, engine: NavEngine) {
             SChoice(L.t("Outside towns"), listOf("5", "10", "15", "20").map { it to it + unit }, prefs.s(PreferenceKeys.FLASH_OUT, "15")) { prefs.put(PreferenceKeys.FLASH_OUT, it) }
         }
         SToggle(prefs, L.t("Speed limit sounds"), PreferenceKeys.LIMIT_SOUNDS, true, L.t("The beep when you go over the limit and the beep or voice when it changes. Off keeps them quiet while cameras, hazards and other alerts still sound"))
+        SToggle(prefs, L.t("Say \"Slow down\""), PreferenceKeys.SAY_SLOW_DOWN, false, L.t("The words \"Slow down\" after the beep when you go over the limit, instead of a beep alone"))
+        SChoice(L.t("Speed alert sound"), listOf("double" to L.t("Double beep"), "siren" to L.t("Siren"), "buzz" to L.t("Low buzz")), prefs.s(PreferenceKeys.SPEED_ALERT_SOUND, "double"),
+            L.t("The sound for going over the limit or the top speed, so it can't be mistaken for the camera and hazard beeps")) { prefs.put(PreferenceKeys.SPEED_ALERT_SOUND, it); engine.testSpeedAlert(it) }
+        SToggle(prefs, L.t("Speed alert in the background"), PreferenceKeys.BG_SPEED_ALERT, false, L.t("Keeps the speed alert going while another app is in front, even with no route. Uses more battery and shows a notification"))
+        SChoice(L.t("Top speed alert"), (if (engine.imperial) listOf("0", "60", "70", "80", "90") else listOf("0", "90", "100", "110", "120", "130", "140")).map { it to (if (it == "0") L.t("Off") else it + if (engine.imperial) " mph" else " km/h") },
+            prefs.s(PreferenceKeys.ALERT_TOP_SPEED, "0"), L.t("A beep and \"Slow down\" when you reach this speed, whatever the limit is")) { prefs.put(PreferenceKeys.ALERT_TOP_SPEED, it) }
         SToggle(prefs, L.t("Say when the limit changes"), "limitchange", true)
         if (prefs.b(PreferenceKeys.LIMITCHANGE, true)) SChoice(L.t("How"), listOf("both" to L.t("Chime and voice"), "voice" to L.t("Voice only"), "chime" to L.t("Chime only")),
             prefs.s(PreferenceKeys.LIMITCHANGE_HOW, "both")) { prefs.put(PreferenceKeys.LIMITCHANGE_HOW, it) }
@@ -874,12 +890,20 @@ private fun SoundSection(prefs: Prefs, engine: NavEngine) {
             L.t("If you hear the beeps but not the spoken directions, choose Media: some head units don't play the navigation channel. If the voice shares the music's volume, try Notification, Alarm or Ringtone (some units call one of these Broadcast)"), wrap = true) { prefs.put(PreferenceKeys.VOICE_CHANNEL, it) }
         if (android.os.Build.VERSION.SDK_INT >= 28 && !engine.isCar) SChoice(L.t("Voice comes out of"), listOf("auto" to L.t("Automatic"), "phone" to L.t("Phone speaker")), prefs.s(PreferenceKeys.VOICE_OUT, "auto"),
             L.t("Phone speaker keeps the directions and chimes on the phone while music plays over Bluetooth. Not for Android Auto, which uses the car's speakers")) { prefs.put(PreferenceKeys.VOICE_OUT, it) }
+        SToggle(prefs, L.t("Pause the music for the voice"), PreferenceKeys.VOICE_PAUSES_MUSIC, false, L.t("Stops the music while the directions are spoken and carries on after, instead of just lowering it. For when lowering isn't enough: how far the music drops is up to your music app"))
         SToggle(prefs, L.t("Play the voice like the chimes"), PreferenceKeys.VOICE_VIA_APP, false, L.t("Turn on if the music is lowered for the beeps but not for the spoken directions: some head units only lower it for sound the app plays itself"))
         SItem(L.t("Voice and language"), L.t("Uses the system text-to-speech voice")) { SButton(L.t("Open")) { openSystemSettings(ctx, "com.android.settings.TTS_SETTINGS") } }
         SItem(L.t("Volume")) { SButton(L.t("Open")) { openSystemSettings(ctx, Settings.ACTION_SOUND_SETTINGS) } }
         SSlider(L.t("Chime volume"), prefs.i(PreferenceKeys.CHIME_VOL, 70).coerceIn(5, 100).toFloat(), 5f..100f, "%",
             sub = L.t("The beeps for speeding, limit changes and cameras, compared with the voice. Your head unit's volume, turned while it speaks, changes both"),
             reset = 70f) { prefs.put(PreferenceKeys.CHIME_VOL, it.toInt()); engine.testChime() }
+        SSlider(L.t("Voice boost"), prefs.i(PreferenceKeys.VOICE_GAIN, 0).coerceIn(0, 18).toFloat(), 0f..18f, " dB",
+            sub = L.t("Makes the spoken directions louder than the music. Very high settings can sound distorted, so turn it up a little at a time. It plays the voice like the chimes, so moving it up turns that switch on"),
+            steps = 17, reset = 0f) {
+            prefs.put(PreferenceKeys.VOICE_GAIN, it)
+            if (it > 0) prefs.put(PreferenceKeys.VOICE_VIA_APP, true)
+            engine.testVoice()
+        }
     }
 }
 
@@ -1215,6 +1239,10 @@ private fun FuelSection(prefs: Prefs, engine: NavEngine) {
     if (prefs.s(PreferenceKeys.FUEL_TYPE, "E10") == "EV") SGroup(L.t("Your electric car"), footer = L.t("With the efficiency and price filled in, each route shows roughly what it will cost to charge for. The efficiency and battery size also give the battery estimate on the trip card and the charging stop suggestions (set your battery level on the route options).")) {
         SToggle(prefs, L.t("Battery estimate on the trip card"), PreferenceKeys.EV_PCT_CARD, true, L.t("Roughly how much battery you'll arrive with, on the phone and Android Auto. It's worked out from your settings, not read from the car"))
         SToggle(prefs, L.t("Show petrol stations too"), PreferenceKeys.EV_SHOW_FUEL, false, L.t("The Fuel button on the map page (on the phone and Android Auto). Off: Charging takes its place"))
+        // the charger list: only fast enough ones, and only the providers you use (Seali7Aut, #343)
+        SChoice(L.t("Charger speed"), listOf("0" to L.t("Any"), "22" to "22 kW+", "50" to "50 kW+", "150" to "150 kW+"), prefs.i(PreferenceKeys.EV_MIN_KW, 0).toString(),
+            L.t("Hide chargers slower than this. Chargers whose speed isn't known are still shown")) { prefs.put(PreferenceKeys.EV_MIN_KW, it.toIntOrNull() ?: 0) }
+        SFieldItem(L.t("Only these providers"), prefs.s(PreferenceKeys.EV_PROVIDERS, ""), L.t("Names separated by commas. Blank shows all"), placeholder = "Ionity, Tesla, Fastned") { prefs.put(PreferenceKeys.EV_PROVIDERS, it.take(120)) }
         if (mi) SFieldItem(L.t("Efficiency (miles per kWh)"), prefs.s(PreferenceKeys.EVMPK, ""), placeholder = L.t("e.g. 3.5"), number = true) { s -> prefs.put(PreferenceKeys.EVMPK, num(s).take(5)) }
         else SFieldItem(L.t("Efficiency (km per kWh)"), prefs.s(PreferenceKeys.EVMPK, "").toDoubleOrNull()?.let { fmt1(it * 1.609344) } ?: "", placeholder = L.t("e.g. 5.6"), number = true) { s ->
             prefs.put(PreferenceKeys.EVMPK, num(s).toDoubleOrNull()?.takeIf { it > 0 }?.let { String.format(java.util.Locale.US, "%.3f", it / 1.609344) } ?: "")
@@ -1281,6 +1309,7 @@ private fun ScreenSection(prefs: Prefs, engine: NavEngine) {
         SSlider(L.t("Brightness"), prefs.i(PreferenceKeys.BRIGHT, 100).toFloat(), 10f..100f, "%", sub = L.t("100% leaves it to the system"), live = true) { prefs.put(PreferenceKeys.BRIGHT, it) }
         SToggle(prefs, L.t("Dim the screen at night"), "dimnight", false)
         SToggle(prefs, L.t("Keep the screen on"), "keepon", true)
+        SToggle(prefs, L.t("Keep the screen on without a route"), PreferenceKeys.KEEPON_NOROUTE, false, L.t("On a phone the screen stays on only while you navigate. Turn this on to keep it on while you just watch the map and traffic. Uses more battery"))
         SToggle(prefs, L.t("Glass panels"), "glass", true, L.t("See-through cards tinted by the map. Off gives solid cards"))
         SToggle(prefs, L.t("New portrait layout"), PreferenceKeys.PORTRAIT_SHEET, true, L.t("On an upright screen with no route: just the search bar at the top, and your places, music and notices in a sheet along the bottom"))
         SChoice(L.t("Mapbox logo position"), listOf("tl" to L.t("Top left"), "tr" to L.t("Top right"), "bl" to L.t("Bottom left"), "br" to L.t("Bottom right")), prefs.s(PreferenceKeys.MAPBOX_LOGO, "tr"),
