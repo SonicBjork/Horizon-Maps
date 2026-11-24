@@ -1764,6 +1764,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             appendLine("Install record: ${Updater.installRecord(ctx)}")
             try { RouteEnds.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Last routes ended:"); append(it) } } catch (e: Throwable) { }
             try { com.headunit.launcher.car.CarCardLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Car search card closed:"); append(it) } } catch (e: Throwable) { }
+            try { VoiceLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Last spoken directions:"); append(it) } } catch (e: Throwable) { }
             try { SoundLog.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Music lowered and given back:"); append(it) } } catch (e: Throwable) { }
             try { NetHealth.text(ctx).takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("Connection problems:"); append(it) } } catch (e: Throwable) { }
             try { BgLog.text().takeIf { it.isNotBlank() }?.let { appendLine(); appendLine("In the background today:"); append(it) } } catch (e: Throwable) { }
@@ -4616,6 +4617,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             if (i1 > i0) map.setMainOnly(r.pts.subList(i0, i1 + 1), r.sev, i0)
         }
         // off the route, the distance along it stays where you left it (until the new route comes) instead of following the nearest bit
+        // The distance along the route is moved on by the glide loop, which runs on the phone's screen refreshes. With the phone's
+        // screen off while Android Auto is on, those can stop or come only now and then, and the directions were worked out from
+        // where you'd been a while back: the call for a turn came after you'd made it, as you set off along the next road, and
+        // the countdown to the next turn never came. When the loop hasn't moved it lately, each fix moves it on instead
+        if (onR && android.os.SystemClock.elapsedRealtime() - gGuideAt > 1500L && mProg > gProg) gProg = min(mProg, r.len)
         val guideProg = if (onR) gProg else if (!jump && s.dist <= offLim) s.progress else if (trustProg >= 0.0) trustProg else s.progress
         onRouteNow = onR
         if (onR) curProg = guideProg
@@ -6435,11 +6441,13 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             val familiar = prefs.b(PreferenceKeys.SMARTVOICE, true) && onRoad.isNotBlank() && (roadFam[onRoad] ?: 0) >= 6
             val fFrom = if (familiar) 330.0 else 520.0
             // a heads-up well ahead on fast roads, then the main call-out, then the final one at the junction
-            if (!familiar && d <= 1700 && d > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e"))
+            // (each call is noted for the problem report, with how far the GPS itself put you from the turn)
+            fun logCall(which: String) = VoiceLog.note(ctx, "${if (isCar) "car" else "phone"} · ${which} · said at ${Math.round(d)} m · GPS ${Math.round(cur.off - mProg)} m · loop ${android.os.SystemClock.elapsedRealtime() - gGuideAt} ms ago")
+            if (!familiar && d <= 1700 && d > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e").also { if (it) logCall("early") })
                 speak(L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase))
-            if (d <= fFrom && d > 200 && said.add("${sk}f"))
+            if (d <= fFrom && d > 200 && said.add("${sk}f").also { if (it) logCall("countdown") })
                 speak(if (lmPhrase.isNotEmpty()) lmPhrase + lane else if (arriving) L.t("In {0}, you will arrive", Geo.spoken(d, imperial)) + (if (side.isNotEmpty()) ". " + L.t("Your destination is on the $side") else "") else L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase) + lane)
-            if (d <= 120 && said.add("${sk}n"))
+            if (d <= 120 && said.add("${sk}n").also { if (it) logCall("at the turn") })
                 speak(if (arriving) (if (side.isNotEmpty()) L.t("Your destination is on the $side") else L.t("You have arrived")) else if (lmPhrase.isNotEmpty()) lmPhrase else phrase.replaceFirstChar { it.uppercase() })
         }
         // a route that stops short of the destination (the downloaded map ran out): at its end, plan on from here instead
