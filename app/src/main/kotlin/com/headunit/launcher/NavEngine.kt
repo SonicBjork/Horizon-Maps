@@ -766,11 +766,12 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                     // (with more still queued, the check in [duck] hands the music back once all of it is said)
                     override fun onDone(id: String?) {
                         if (id?.startsWith("file") == true) { voiceFileReady(id, true); return }
-                        if (id?.startsWith("part") != true && tts?.isSpeaking != true && !viaBusy) unduck()
+                        // (nor after the moment of silence before a line on Android Auto: the line itself comes next)
+                        if (id?.startsWith("part") != true && id != "lead" && tts?.isSpeaking != true && !viaBusy) unduck()
                     }
                     @Deprecated("Deprecated in Java") override fun onError(id: String?) {
                         if (id?.startsWith("file") == true) { voiceFileReady(id, false); return }
-                        if (id?.startsWith("part") != true) unduck()
+                        if (id?.startsWith("part") != true && id != "lead") unduck()
                     }
                 })
             }
@@ -862,6 +863,8 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build()
     private val audioMgr = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
     private var focusReq: android.media.AudioFocusRequest? = null
+    /** The moment of silence before a line that starts from quiet on Android Auto, while the car's speakers switch over to it. */
+    private val CAR_VOICE_LEAD_MS = 900L
 
     /** Lowers the music while a spoken instruction plays, so it can be heard. */
     /**
@@ -7689,21 +7692,32 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         if (m == 2 || (m == 1 && !alert) || !ttsReady) return
         val ch = prefs.s(PreferenceKeys.VOICE_CHANNEL, "nav")
         if (ch != voiceChan) { voiceChan = ch; try { tts?.setAudioAttributes(speechAttrs) } catch (e: Exception) { } }
+        // On Android Auto the car's speakers switch over to the phone's voice when it starts, and that takes about a second: the
+        // start of the line was lost ("In 300 metres, turn left" came out as "turn left", heard as you joined the road, and the
+        // short call at the turn itself not at all). So a line that starts from quiet (the voice not already going, nor about to)
+        // begins with a moment of silence. Lines straight after one another don't need it: the speakers are still switched over
+        val leadMs = if (isCar && focusReq == null && tts?.isSpeaking != true && !viaBusy) CAR_VOICE_LEAD_MS else 0L
         duck()
         // a direction cuts off whatever is being said; an alert waits its turn, so a speed limit or camera call can no longer
         // cut a direction off half way (with limits changing often in town, some directions were never heard)
         val mode = if (alert) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH
         val parts = try { foreignParts(text) } catch (e: Exception) { null }
         if (parts == null && (prefs.b(PreferenceKeys.VOICE_VIA_APP, false) || phoneSpeaker() != null) && speakViaApp(text, alert)) return
-        if (parts == null) { tts?.speak(text, mode, null, "nav"); return }
+        if (parts == null) {
+            val t0 = tts ?: return
+            if (leadMs > 0) { t0.playSilentUtterance(leadMs, mode, "lead"); t0.speak(text, TextToSpeech.QUEUE_ADD, null, "nav") }
+            else t0.speak(text, mode, null, "nav")
+            return
+        }
         // a street name in letters the voice can't read (Hebrew names with an English voice, say): it used to be skipped. Each such
         // part is said in the phone's voice for those letters, and the rest in the usual voice (Dotancom). Each part takes the
         // voice set when it's queued, so the usual voice is put back at the end.
         val t = tts ?: return
         try {
+            if (leadMs > 0) t.playSilentUtterance(leadMs, mode, "lead")
             parts.forEachIndexed { i, (part, loc) ->
                 if (loc != null) t.setLanguage(loc) else setVoiceLanguage()
-                t.speak(part, if (i == 0) mode else TextToSpeech.QUEUE_ADD, null, if (i == parts.lastIndex) "nav" else "part$i")
+                t.speak(part, if (i == 0 && leadMs == 0L) mode else TextToSpeech.QUEUE_ADD, null, if (i == parts.lastIndex) "nav" else "part$i")
             }
         } finally {
             try { setVoiceLanguage() } catch (e: Exception) { }
