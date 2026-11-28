@@ -1433,6 +1433,13 @@ private fun AndroidAutoSection(prefs: Prefs) {
     SGroup {
         SChoice(L.t("Cool running"), listOf("off" to L.t("Off"), "auto" to L.t("Automatic"), "always" to L.t("Always")), prefs.s(PreferenceKeys.CAR_COOL, "off"),
             L.t("For phones that get hot: 30 frames a second, a flat map, no rain or lamp effects. Automatic turns it on when the phone reports it's getting hot")) { prefs.put(PreferenceKeys.CAR_COOL, it) }
+        // the pause before each spoken line on Android Auto (also in the car's own Settings)
+        run {
+            val steps = listOf(0, 1000, 2000, 3000, 4000)
+            val lead = prefs.i(PreferenceKeys.CAR_VOICE_LEAD, 1000).let { v -> steps.minByOrNull { kotlin.math.abs(it - v) } ?: 1000 }
+            SChoice(L.t("Voice start pause"), steps.map { it.toString() to (if (it == 0) L.t("Off") else "${it / 1000} s") }, lead.toString(),
+                L.t("Some cars cut off the start of each direction while their speakers switch over to it (\"In 500 metres, turn right\" heard as just \"turn right\"). A longer pause fixes that; the directions start that much earlier to make up for it")) { prefs.put(PreferenceKeys.CAR_VOICE_LEAD, it.toInt()) }
+        }
         SToggle(prefs, L.t("Search bar and places on the map"), PreferenceKeys.CAR_MAPUI, true, L.t("Off for a car with a rotary knob: the full map, with Search, Home and Work under Places (★)"))
         if (prefs.b(PreferenceKeys.CAR_MAPUI, true)) SChoice(L.t("Hide them after"), listOf("30" to L.t("30 s"), "60" to L.t("1 min"), "120" to L.t("2 min"), "300" to L.t("5 min"), "0" to L.t("Never")),
             prefs.s(PreferenceKeys.CAR_MAPUI_HIDE, "0"), L.t("Comes back when you touch the screen")) { prefs.put(PreferenceKeys.CAR_MAPUI_HIDE, it) }
