@@ -863,8 +863,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH).build()
     private val audioMgr = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
     private var focusReq: android.media.AudioFocusRequest? = null
-    /** The moment of silence before a line that starts from quiet on Android Auto, while the car's speakers switch over to it. */
-    private val CAR_VOICE_LEAD_MS = 900L
+    /**
+     * The pause before a line that starts from quiet on Android Auto, while the car's speakers switch over to it (Android Auto
+     * settings › Voice start pause). Cars differ: some lose about a second of the start, others two or more.
+     */
+    val carVoiceLeadMs: Long get() = prefs.i(PreferenceKeys.CAR_VOICE_LEAD, 1000).coerceIn(0, 5000).toLong()
 
     /** Lowers the music while a spoken instruction plays, so it can be heard. */
     /**
@@ -6443,14 +6446,17 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             // on roads you drive a lot the early heads-ups are skipped and the main one comes a little later
             val familiar = prefs.b(PreferenceKeys.SMARTVOICE, true) && onRoad.isNotBlank() && (roadFam[onRoad] ?: 0) >= 6
             val fFrom = if (familiar) 330.0 else 520.0
+            // on Android Auto each line starts after the pause for the car's speakers (Voice start pause), so the calls are
+            // started that much earlier: the words still come at the same place on the road
+            val dv = if (isCar) d - carVoiceLeadMs / 1000.0 * (fix?.speed ?: 0.0).coerceAtLeast(0.0) else d
             // a heads-up well ahead on fast roads, then the main call-out, then the final one at the junction
             // (each call is noted for the problem report, with how far the GPS itself put you from the turn)
             fun logCall(which: String) = VoiceLog.note(ctx, "${if (isCar) "car" else "phone"} · ${which} · said at ${Math.round(d)} m · GPS ${Math.round(cur.off - mProg)} m · loop ${android.os.SystemClock.elapsedRealtime() - gGuideAt} ms ago")
-            if (!familiar && d <= 1700 && d > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e").also { if (it) logCall("early") })
+            if (!familiar && dv <= 1700 && dv > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e").also { if (it) logCall("early") })
                 speak(L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase))
-            if (d <= fFrom && d > 200 && said.add("${sk}f").also { if (it) logCall("countdown") })
+            if (dv <= fFrom && dv > 200 && said.add("${sk}f").also { if (it) logCall("countdown") })
                 speak(if (lmPhrase.isNotEmpty()) lmPhrase + lane else if (arriving) L.t("In {0}, you will arrive", Geo.spoken(d, imperial)) + (if (side.isNotEmpty()) ". " + L.t("Your destination is on the $side") else "") else L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase) + lane)
-            if (d <= 120 && said.add("${sk}n").also { if (it) logCall("at the turn") })
+            if (dv <= 120 && said.add("${sk}n").also { if (it) logCall("at the turn") })
                 speak(if (arriving) (if (side.isNotEmpty()) L.t("Your destination is on the $side") else L.t("You have arrived")) else if (lmPhrase.isNotEmpty()) lmPhrase else phrase.replaceFirstChar { it.uppercase() })
         }
         // a route that stops short of the destination (the downloaded map ran out): at its end, plan on from here instead
@@ -7696,7 +7702,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         // start of the line was lost ("In 300 metres, turn left" came out as "turn left", heard as you joined the road, and the
         // short call at the turn itself not at all). So a line that starts from quiet (the voice not already going, nor about to)
         // begins with a moment of silence. Lines straight after one another don't need it: the speakers are still switched over
-        val leadMs = if (isCar && focusReq == null && tts?.isSpeaking != true && !viaBusy) CAR_VOICE_LEAD_MS else 0L
+        val leadMs = if (isCar && focusReq == null && tts?.isSpeaking != true && !viaBusy) carVoiceLeadMs else 0L
         duck()
         // a direction cuts off whatever is being said; an alert waits its turn, so a speed limit or camera call can no longer
         // cut a direction off half way (with limits changing often in town, some directions were never heard)

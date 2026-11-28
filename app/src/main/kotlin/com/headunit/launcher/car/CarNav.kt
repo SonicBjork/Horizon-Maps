@@ -1608,6 +1608,13 @@ class CarSettingsScreen(carContext: CarContext, private val holder: CarHolder, p
             .addText(L.t(listOf("All directions and alerts", "Alerts only (cameras, limits, hazards)", "Off")[sm.coerceIn(0, 2)]))
             .setImage(CarIcon.Builder(IconCompat.createWithResource(carContext, when (sm) { 0 -> R.drawable.ic_car_sound_on; 1 -> R.drawable.ic_car_sound_alerts; else -> R.drawable.ic_car_sound_off })).build())
             .setOnClickListener { if (e != null) e.cycleSound() else prefs.put(PreferenceKeys.SOUND_MODE, (sm + 1) % 3); invalidate() }.build()
+        // the pause before each spoken line, for cars that cut off its start while their speakers switch over to the voice
+        // (the countdown "In 500 metres, turn right" was heard as just "turn right", and the short call at the turn not at all)
+        val leadSteps = listOf(0, 1000, 2000, 3000, 4000)
+        val lead = prefs.i(PreferenceKeys.CAR_VOICE_LEAD, 1000).let { v -> leadSteps.minByOrNull { kotlin.math.abs(it - v) } ?: 1000 }
+        rows += Row.Builder().setTitle(L.t("Voice start pause"))
+            .addText(if (lead == 0) L.t("Off · tap if the start of directions is cut off") else L.t("{0} s · tap for longer if the start of directions is cut off", lead / 1000))
+            .setOnClickListener { prefs.put(PreferenceKeys.CAR_VOICE_LEAD, leadSteps[(leadSteps.indexOf(lead) + 1) % leadSteps.size]); invalidate() }.build()
         // north up or turning with you (GitHub #39)
         val nu = e?.northUp ?: prefs.b(PreferenceKeys.NORTH_UP_CAR, false)
         rows += Row.Builder().setTitle(L.t("Map direction"))
