@@ -766,12 +766,11 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
                     // (with more still queued, the check in [duck] hands the music back once all of it is said)
                     override fun onDone(id: String?) {
                         if (id?.startsWith("file") == true) { voiceFileReady(id, true); return }
-                        // (nor after the moment of silence before a line on Android Auto: the line itself comes next)
-                        if (id?.startsWith("part") != true && id != "lead" && tts?.isSpeaking != true && !viaBusy) unduck()
+                        if (id?.startsWith("part") != true && tts?.isSpeaking != true && !viaBusy && !prerolling()) unduck()
                     }
                     @Deprecated("Deprecated in Java") override fun onError(id: String?) {
                         if (id?.startsWith("file") == true) { voiceFileReady(id, false); return }
-                        if (id?.startsWith("part") != true && id != "lead") unduck()
+                        if (id?.startsWith("part") != true && !prerolling()) unduck()
                     }
                 })
             }
@@ -889,7 +888,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             var quiet = 0
             repeat(60) {
                 if (t != duckToken || focusReq == null) return@launch
-                if (tts?.isSpeaking != true && !viaBusy) { if (++quiet >= 2) { unduck(); return@launch } } else quiet = 0
+                if (tts?.isSpeaking != true && !viaBusy && !prerolling()) { if (++quiet >= 2) { unduck(); return@launch } } else quiet = 0
                 delay(1000)
             }
             if (t == duckToken) unduck()
@@ -6451,7 +6450,7 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
             val dv = if (isCar) d - carVoiceLeadMs / 1000.0 * (fix?.speed ?: 0.0).coerceAtLeast(0.0) else d
             // a heads-up well ahead on fast roads, then the main call-out, then the final one at the junction
             // (each call is noted for the problem report, with how far the GPS itself put you from the turn)
-            fun logCall(which: String) = VoiceLog.note(ctx, "${if (isCar) "car" else "phone"} · ${which} · said at ${Math.round(d)} m · GPS ${Math.round(cur.off - mProg)} m · loop ${android.os.SystemClock.elapsedRealtime() - gGuideAt} ms ago")
+            fun logCall(which: String) = VoiceLog.note(ctx, "${if (isCar) "car" else "phone"} · ${which} · said at ${Math.round(d)} m · GPS ${Math.round(cur.off - mProg)} m · loop ${android.os.SystemClock.elapsedRealtime() - gGuideAt} ms ago" + (if (isCar) " · pause ${carVoiceLeadMs} ms" else ""))
             if (!familiar && dv <= 1700 && dv > 1100 && p0Speed() > 18.0 && !arriving && said.add("${sk}e").also { if (it) logCall("early") })
                 speak(L.t("In {0}, {1}", Geo.spoken(d, imperial), phrase))
             if (dv <= fFrom && dv > 200 && said.add("${sk}f").also { if (it) logCall("countdown") })
@@ -7698,32 +7697,63 @@ class NavEngine(private val ctx: Context, val prefs: Prefs, val map: MapBinding)
         if (m == 2 || (m == 1 && !alert) || !ttsReady) return
         val ch = prefs.s(PreferenceKeys.VOICE_CHANNEL, "nav")
         if (ch != voiceChan) { voiceChan = ch; try { tts?.setAudioAttributes(speechAttrs) } catch (e: Exception) { } }
-        // On Android Auto the car's speakers switch over to the phone's voice when it starts, and that takes about a second: the
-        // start of the line was lost ("In 300 metres, turn left" came out as "turn left", heard as you joined the road, and the
-        // short call at the turn itself not at all). So a line that starts from quiet (the voice not already going, nor about to)
-        // begins with a moment of silence. Lines straight after one another don't need it: the speakers are still switched over
-        val leadMs = if (isCar && focusReq == null && tts?.isSpeaking != true && !viaBusy) carVoiceLeadMs else 0L
+        // On Android Auto the car's speakers switch over to the phone's voice when it starts, which takes a second or more on some
+        // cars, and the start of the line was lost: "In 500 metres, turn right onto ..." came out as "turn right onto ...", heard as
+        // you joined the road, and the short call at the turn itself not at all. A silent pause in the speech engine didn't help (it
+        // sends no sound, so the car only switched over when the words began). So a line that starts from quiet first plays real,
+        // inaudible sound on the voice channel for the Voice start pause, and the words follow once the car's speakers are over.
+        // Lines straight after one another don't need it: the speakers are still switched over
+        val now = android.os.SystemClock.elapsedRealtime()
+        val leadMs = if (isCar && focusReq == null && tts?.isSpeaking != true && !viaBusy && now >= prerollUntil) carVoiceLeadMs else 0L
         duck()
+        if (leadMs > 0) { prerollUntil = now + leadMs; preroll(leadMs) }
+        // (a line asked for while that sound plays waits for it too, in order)
+        val wait = prerollUntil - now
+        if (wait > 0) { val seq = if (alert) prerollSeq else ++prerollSeq; viaMain.postDelayed({ if (alert || seq == prerollSeq) sayNow(text, alert) }, wait) }
+        else sayNow(text, alert)
+    }
+
+    /** Until when (elapsed ms) the inaudible sound before a line on Android Auto plays (the voice counts as busy until then). */
+    @Volatile private var prerollUntil = 0L
+    /** (a direction asked for during it replaces one still waiting, as a direction cuts off what's being said) */
+    private var prerollSeq = 0
+    private fun prerolling() = android.os.SystemClock.elapsedRealtime() < prerollUntil
+
+    /** Plays [ms] of inaudible sound on the voice channel, so the car switches its speakers over to the voice before the words. */
+    private fun preroll(ms: Long) {
+        try {
+            val rate = 16000
+            val n = (rate * ms / 1000).toInt().coerceAtLeast(160)
+            // (the faintest possible sound rather than exact silence, which some systems treat as nothing playing)
+            val buf = ShortArray(n) { if (it % 2 == 0) 1 else -1 }
+            val at = android.media.AudioTrack.Builder()
+                .setAudioAttributes(speechAttrs)
+                .setAudioFormat(android.media.AudioFormat.Builder().setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(rate).setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO).build())
+                .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(n * 2)
+                .build()
+            at.write(buf, 0, n)
+            at.play()
+            viaMain.postDelayed({ try { at.stop() } catch (e: Exception) { }; try { at.release() } catch (e: Exception) { } }, ms + 500)
+        } catch (e: Exception) { android.util.Log.w("NavEngine", "voice pre-roll failed", e) }
+    }
+
+    private fun sayNow(text: String, alert: Boolean) {
         // a direction cuts off whatever is being said; an alert waits its turn, so a speed limit or camera call can no longer
         // cut a direction off half way (with limits changing often in town, some directions were never heard)
         val mode = if (alert) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH
         val parts = try { foreignParts(text) } catch (e: Exception) { null }
         if (parts == null && (prefs.b(PreferenceKeys.VOICE_VIA_APP, false) || phoneSpeaker() != null) && speakViaApp(text, alert)) return
-        if (parts == null) {
-            val t0 = tts ?: return
-            if (leadMs > 0) { t0.playSilentUtterance(leadMs, mode, "lead"); t0.speak(text, TextToSpeech.QUEUE_ADD, null, "nav") }
-            else t0.speak(text, mode, null, "nav")
-            return
-        }
+        if (parts == null) { tts?.speak(text, mode, null, "nav"); return }
         // a street name in letters the voice can't read (Hebrew names with an English voice, say): it used to be skipped. Each such
         // part is said in the phone's voice for those letters, and the rest in the usual voice (Dotancom). Each part takes the
         // voice set when it's queued, so the usual voice is put back at the end.
         val t = tts ?: return
         try {
-            if (leadMs > 0) t.playSilentUtterance(leadMs, mode, "lead")
             parts.forEachIndexed { i, (part, loc) ->
                 if (loc != null) t.setLanguage(loc) else setVoiceLanguage()
-                t.speak(part, if (i == 0 && leadMs == 0L) mode else TextToSpeech.QUEUE_ADD, null, if (i == parts.lastIndex) "nav" else "part$i")
+                t.speak(part, if (i == 0) mode else TextToSpeech.QUEUE_ADD, null, if (i == parts.lastIndex) "nav" else "part$i")
             }
         } finally {
             try { setVoiceLanguage() } catch (e: Exception) { }
