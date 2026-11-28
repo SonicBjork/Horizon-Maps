@@ -114,6 +114,13 @@ internal fun CarSettingsPanel(engine: NavEngine, actions: CarActions, small: Boo
                             val sm = prefs.i(PreferenceKeys.SOUND_MODE, if (prefs.b(PreferenceKeys.VOICE, true)) 0 else 2).coerceIn(0, 2)
                             SetChoice("st-snd", L.t("Voice guidance"), listOf("0" to L.t("All"), "1" to L.t("Alerts only"), "2" to L.t("Off")), sm.toString()) { prefs.put(PreferenceKeys.SOUND_MODE, it.toInt()) }
                         }
+                        // the pause before each spoken line, for cars that cut off its start while their speakers switch over to the voice
+                        // (the countdown "In 500 metres, turn right" was heard as just "turn right", and the short call at the turn not at all)
+                        item {
+                            val steps = listOf(0, 1000, 2000, 3000, 4000)
+                            val lead = prefs.i(PreferenceKeys.CAR_VOICE_LEAD, 1000).let { v -> steps.minByOrNull { kotlin.math.abs(it - v) } ?: 1000 }
+                            SetChoice("st-lead", L.t("Voice start pause (if the start of directions is cut off)"), steps.map { it.toString() to (if (it == 0) L.t("Off") else "${it / 1000} s") }, lead.toString()) { prefs.put(PreferenceKeys.CAR_VOICE_LEAD, it.toInt()) }
+                        }
                         item { SetSwitch("st-mw", L.t("Avoid motorways"), "", prefs.b("avoid_motorway", false)) { prefs.put("avoid_motorway", it); reroute() } }
                         item { SetSwitch("st-toll", L.t("Avoid toll roads"), "", prefs.b("avoid_toll", false)) { prefs.put("avoid_toll", it); reroute() } }
                         item { SetSwitch("st-ferry", L.t("Avoid ferries"), "", prefs.b("avoid_ferry", false)) { prefs.put("avoid_ferry", it); reroute() } }
