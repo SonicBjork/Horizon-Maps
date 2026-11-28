@@ -46,6 +46,8 @@ internal object PreferenceKeys {
     const val UI_SCALE = "uiscale"
     const val UI_AUTO_SCALE = "uiauto"
     const val SOUND_MODE = "soundmode"
+    /** Android Auto: the pause (ms) before a line that starts from quiet, while the car's speakers switch over to the voice. */
+    const val CAR_VOICE_LEAD = "carvoicelead"
     const val FUEL_TYPE = "fueltype"
     const val PACK_REGION = "packregion"
     const val ETA_NUMBER = "etanum"
